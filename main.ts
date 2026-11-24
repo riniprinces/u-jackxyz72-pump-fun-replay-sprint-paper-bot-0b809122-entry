@@ -6,10 +6,13 @@
 // of real reserves are different: they have sustained buying, and a large
 // share of them keep running toward completion (85 SOL real). So this bot
 // buys ONLY coins whose real SOL reserve has reached 50 SOL, with a fixed
-// 0.20 SOL stake, and exits fast: take profit at +100% of all-in cost,
-// stop loss at -15%, or a 600-slot time stop (about 4 minutes). It wins
-// small and often, one coin at a time, never more than 5 open positions,
-// and it never re-enters a coin it already traded.
+// 0.20 SOL stake, and exits fast: take profit at +50% of all-in cost,
+// stop loss at -15%, or a 900-slot time stop (about 6 minutes). Banking
+// winners at +50% instead of waiting for a double matters: the +100%
+// version's gains came mostly from its 3 best coins, so it fell apart on
+// rebuilt windows, while the +50% version stays positive even without its
+// best coins. It wins small and often, one coin at a time, never more than
+// 5 open positions, and it never re-enters a coin it already traded.
 //
 // Everything is deterministic: every decision comes from the replay data
 // itself — the slot numbers, the order of events in each batch, and the
@@ -27,7 +30,6 @@
 
 import * as readline from 'node:readline';
 
-const LAMPORTS_PER_SOL = 1_000_000_000n;
 const SOL = (x: number): bigint => BigInt(Math.round(x * 1_000_000_000));
 
 // --- strategy parameters (chosen on the dev window by offline simulation) ---
@@ -36,9 +38,9 @@ const FALLBACK_REAL_SOL = 40; // late-window fallback so the 20-coin bar is met
 const STAKE_LAMPORTS = SOL(0.2); // paper SOL per entry
 const FALLBACK_STAKE_LAMPORTS = SOL(0.05);
 const MIN_BUY_LAMPORTS = SOL(0.01); // guardrail: round trips must be >= this
-const TAKE_PROFIT = 2.0; // sell when marked value reaches 2x all-in cost
+const TAKE_PROFIT = 1.5; // sell when marked value reaches 1.5x all-in cost
 const STOP_LOSS = 0.85; // sell when marked value falls to 0.85x all-in cost
-const MAX_HOLD_SLOTS = 600; // time stop, in slots since the buy filled
+const MAX_HOLD_SLOTS = 900; // time stop, in slots since the buy filled
 const MAX_SLIPPAGE_BPS = 10_000; // wide open: never refuse a fill on slippage
 const MAX_OPEN_POSITIONS = 5;
 const MAX_ORDERS_PER_BATCH = 16;
