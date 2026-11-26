@@ -1,18 +1,19 @@
 // Pump.fun Replay Sprint — paper trading bot (agent-fun/replay/v2).
 //
-// Strategy: late-stage completion chase. On the dev window almost every
-// pump.fun coin bleeds after its early run, so buying early momentum loses
-// money on most coins. Coins that survive long enough to accumulate 50 SOL
-// of real reserves are different: they have sustained buying, and a large
-// share of them keep running toward completion (85 SOL real). So this bot
-// buys ONLY coins whose real SOL reserve has reached 50 SOL, with a fixed
-// 0.20 SOL stake, and exits fast: take profit at +50% of all-in cost,
-// stop loss at -15%, or a 900-slot time stop (about 6 minutes). Banking
-// winners at +50% instead of waiting for a double matters: the +100%
-// version's gains came mostly from its 3 best coins, so it fell apart on
-// rebuilt windows, while the +50% version stays positive even without its
-// best coins. It wins small and often, one coin at a time, never more than
-// 5 open positions, and it never re-enters a coin it already traded.
+// The idea: late-stage completion chase. Across the dev window, nearly
+// every pump.fun coin bleeds after its early run, so buying early
+// momentum loses money on most coins. Coins that survive long enough to
+// accumulate 50 SOL of real reserves are different — they have sustained
+// buying behind them, and a large share keep running toward completion
+// (85 SOL real). This bot therefore buys ONLY coins whose real SOL
+// reserve has reached 50 SOL, with a fixed 0.20 SOL stake, and exits
+// fast: take profit at +50% of all-in cost, stop loss at -15%, or a
+// 900-slot time stop (about 6 minutes). Banking winners at +50% instead
+// of waiting for a double matters: the +100% version's gains came mostly
+// from its 3 best coins, so it fell apart on rebuilt windows, while the
+// +50% version stays positive even without its best coins. It wins small
+// and often, one coin at a time, never more than 5 open positions, and it
+// never re-enters a coin it already traded.
 //
 // Everything is deterministic: every decision comes from the replay data
 // itself — the slot numbers, the order of events in each batch, and the
@@ -30,22 +31,6 @@
 
 import * as readline from 'node:readline';
 
-const SOL = (x: number): bigint => BigInt(Math.round(x * 1_000_000_000));
-
-// --- strategy parameters (chosen on the dev window by offline simulation) ---
-const ENTRY_REAL_SOL = 50; // enter once a curve holds this much real SOL
-const FALLBACK_REAL_SOL = 40; // late-window fallback so the 20-coin bar is met
-const STAKE_LAMPORTS = SOL(0.2); // paper SOL per entry
-const FALLBACK_STAKE_LAMPORTS = SOL(0.05);
-const MIN_BUY_LAMPORTS = SOL(0.01); // guardrail: round trips must be >= this
-const TAKE_PROFIT = 1.5; // sell when marked value reaches 1.5x all-in cost
-const STOP_LOSS = 0.85; // sell when marked value falls to 0.85x all-in cost
-const MAX_HOLD_SLOTS = 900; // time stop, in slots since the buy filled
-const MAX_SLIPPAGE_BPS = 10_000; // wide open: never refuse a fill on slippage
-const MAX_OPEN_POSITIONS = 5;
-const MAX_ORDERS_PER_BATCH = 16;
-const WINDOW_SLOTS = 403_213; // dev window length, for the late fallback
-
 type Mint = string;
 
 interface Curve {
@@ -62,6 +47,34 @@ interface Held {
   openedSlot: number;
 }
 
+interface Order {
+  side: 'buy' | 'sell';
+  client_id: string;
+  mint: Mint;
+  quote_lamports?: string;
+  token_amount?: string;
+  max_slippage_bps: number;
+}
+
+const lamports = (sol: number): bigint => BigInt(Math.round(sol * 1_000_000_000));
+
+// Strategy parameters, chosen on the dev window by offline simulation.
+const STRATEGY = {
+  entryRealSol: 50, // enter once a curve holds this much real SOL
+  fallbackRealSol: 40, // late-window fallback so the 20-coin bar is met
+  stakeLamports: lamports(0.2), // paper SOL per entry
+  fallbackStakeLamports: lamports(0.05),
+  minBuyLamports: lamports(0.01), // guardrail: round trips must be >= this
+  takeProfit: 1.5, // sell when marked value reaches 1.5x all-in cost
+  stopLoss: 0.85, // sell when marked value falls to 0.85x all-in cost
+  maxHoldSlots: 900, // time stop, in slots since the buy filled
+  maxSlippageBps: 10_000, // wide open: never refuse a fill on slippage
+  maxOpenPositions: 5,
+  maxOrdersPerBatch: 16,
+  windowSlots: 403_213, // dev window length, for the late fallback
+} as const;
+
+// --- live state, rebuilt from the harness messages as they arrive ---
 const curves = new Map<Mint, Curve>();
 const held = new Map<Mint, Held>(); // positions, from the latest account
 const openedAt = new Map<Mint, number>(); // slot each buy filled at
@@ -75,39 +88,40 @@ let maxOrderBps = 100;
 let firstSlot = -1;
 let orderCounter = 1;
 
-function valueOf(h: Held, c: Curve): bigint {
+function blankCurve(): Curve {
+  return {
+    virtualToken: 0n,
+    virtualQuote: 0n,
+    realQuote: 0n,
+    complete: false,
+    createdSlot: null,
+  };
+}
+
+function markedValue(h: Held, c: Curve): bigint {
   // Marked value of the holding in lamports, before exit fees.
   if (c.virtualToken === 0n) return 0n;
   return (h.tokens * c.virtualQuote) / c.virtualToken;
 }
 
-function committedPositions(): number {
+function openPositionCount(): number {
   const mints = new Set<Mint>(held.keys());
   for (const m of pendingBuy.keys()) mints.add(m);
   return mints.size;
 }
 
-function freeCash(): bigint {
+function availableCash(): bigint {
   // Cash minus what pending buys will take if they fill (amount + tx fee).
   let free = cash;
   for (const amount of pendingBuy.values()) free -= amount + txFee;
   return free;
 }
 
-interface Order {
-  side: 'buy' | 'sell';
-  client_id: string;
-  mint: Mint;
-  quote_lamports?: string;
-  token_amount?: string;
-  max_slippage_bps: number;
-}
-
-function nextId(): string {
+function nextClientId(): string {
   return `o${orderCounter++}`;
 }
 
-function onBatch(batch: any): Order[] {
+function processBatch(batch: any): Order[] {
   const slot: number = batch.slot;
   if (firstSlot < 0) firstSlot = slot;
   const orders: Order[] = [];
@@ -149,13 +163,7 @@ function onBatch(batch: any): Order[] {
   //    batch's events in chain order. After this step the curves hold the
   //    end-of-slot reserves the decision is made on.
   for (const m of batch.marks ?? []) {
-    const c = curves.get(m.mint) ?? {
-      virtualToken: 0n,
-      virtualQuote: 0n,
-      realQuote: 0n,
-      complete: false,
-      createdSlot: null,
-    };
+    const c = curves.get(m.mint) ?? blankCurve();
     c.virtualToken = BigInt(m.virtual_token_reserves);
     c.virtualQuote = BigInt(m.virtual_quote_reserves);
     c.realQuote = BigInt(m.real_quote_reserves);
@@ -171,13 +179,7 @@ function onBatch(batch: any): Order[] {
         createdSlot: e.slot,
       });
     } else if (e.event === 'TradeEvent') {
-      const c = curves.get(e.mint) ?? {
-        virtualToken: 0n,
-        virtualQuote: 0n,
-        realQuote: 0n,
-        complete: false,
-        createdSlot: null,
-      };
+      const c = curves.get(e.mint) ?? blankCurve();
       c.virtualToken = BigInt(e.virtual_token_reserves);
       c.virtualQuote = BigInt(e.virtual_quote_reserves);
       c.realQuote = BigInt(e.real_quote_reserves);
@@ -196,16 +198,16 @@ function onBatch(batch: any): Order[] {
     const c = curves.get(mint);
     if (!c || c.complete) continue;
     if (h.cost === 0n) continue;
-    const mult = Number(valueOf(h, c)) / Number(h.cost);
-    const tooOld = slot - h.openedSlot > MAX_HOLD_SLOTS;
-    if (mult >= TAKE_PROFIT || mult <= STOP_LOSS || tooOld) {
-      if (orders.length >= MAX_ORDERS_PER_BATCH) break;
+    const mult = Number(markedValue(h, c)) / Number(h.cost);
+    const tooOld = slot - h.openedSlot > STRATEGY.maxHoldSlots;
+    if (mult >= STRATEGY.takeProfit || mult <= STRATEGY.stopLoss || tooOld) {
+      if (orders.length >= STRATEGY.maxOrdersPerBatch) break;
       orders.push({
         side: 'sell',
-        client_id: nextId(),
+        client_id: nextClientId(),
         mint,
         token_amount: h.tokens.toString(),
-        max_slippage_bps: MAX_SLIPPAGE_BPS,
+        max_slippage_bps: STRATEGY.maxSlippageBps,
       });
       pendingSell.add(mint);
     }
@@ -219,13 +221,13 @@ function onBatch(batch: any): Order[] {
   //    still short, so the main rule is never diluted early.
   const fallbackActive =
     firstSlot >= 0 &&
-    slot - firstSlot > Math.floor(WINDOW_SLOTS * 0.7) &&
+    slot - firstSlot > Math.floor(STRATEGY.windowSlots * 0.7) &&
     distinctTrips.size < 20;
-  const entryReal = fallbackActive ? FALLBACK_REAL_SOL : ENTRY_REAL_SOL;
-  const stake = fallbackActive ? FALLBACK_STAKE_LAMPORTS : STAKE_LAMPORTS;
+  const entryReal = fallbackActive ? STRATEGY.fallbackRealSol : STRATEGY.entryRealSol;
+  const stake = fallbackActive ? STRATEGY.fallbackStakeLamports : STRATEGY.stakeLamports;
 
   for (const e of batch.events ?? []) {
-    if (orders.length >= MAX_ORDERS_PER_BATCH) break;
+    if (orders.length >= STRATEGY.maxOrdersPerBatch) break;
     const mint: Mint = e.mint;
     if (decided.has(mint) || held.has(mint) || pendingBuy.has(mint)) continue;
     const c = curves.get(mint);
@@ -235,15 +237,15 @@ function onBatch(batch: any): Order[] {
     // Size cap: at most maxOrderBps of the real reserve in one batch.
     const cap = (c.realQuote * BigInt(maxOrderBps)) / 10_000n;
     const amount = cap < stake ? cap : stake;
-    if (amount < MIN_BUY_LAMPORTS) continue;
-    if (committedPositions() >= MAX_OPEN_POSITIONS) continue;
-    if (freeCash() < amount + txFee) continue;
+    if (amount < STRATEGY.minBuyLamports) continue;
+    if (openPositionCount() >= STRATEGY.maxOpenPositions) continue;
+    if (availableCash() < amount + txFee) continue;
     orders.push({
       side: 'buy',
-      client_id: nextId(),
+      client_id: nextClientId(),
       mint,
       quote_lamports: amount.toString(),
-      max_slippage_bps: MAX_SLIPPAGE_BPS,
+      max_slippage_bps: STRATEGY.maxSlippageBps,
     });
     pendingBuy.set(mint, amount);
     decided.add(mint);
@@ -252,7 +254,7 @@ function onBatch(batch: any): Order[] {
   return orders;
 }
 
-async function main(): Promise<void> {
+async function run(): Promise<void> {
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const line of rl) {
     if (!line.trim()) continue;
@@ -264,7 +266,7 @@ async function main(): Promise<void> {
       txFee = BigInt(msg.fees.base_fee_lamports) + BigInt(msg.fees.priority_fee_lamports);
       maxOrderBps = msg.caps.max_order_bps_of_real_reserve;
     } else if (msg.type === 'batch') {
-      const orders = onBatch(msg);
+      const orders = processBatch(msg);
       process.stdout.write(JSON.stringify({ type: 'reply', seq: msg.seq, orders }) + '\n');
     } else if (msg.type === 'done') {
       break;
@@ -272,4 +274,4 @@ async function main(): Promise<void> {
   }
 }
 
-await main();
+await run();
